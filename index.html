@@ -1,0 +1,1610 @@
+<!DOCTYPE html><html>
+
+<title>Water Simulation</title>
+
+<canvas id='ui-canvas'></canvas>
+
+<style>body{margin:0;overflow:hidden;}</style>
+
+<script src='https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js'></script>
+
+<script src='https://cdn.jsdelivr.net/gh/Dddatt/D.js@v2.3.0/index.js'></script>
+
+<script type='application/javascript'>
+
+function main(){
+
+let width=window.innerWidth,height=window.innerHeight,aspect=width/height,halfWidth=width>>1,halfHeight=height>>1
+
+let glCanvas=new OffscreenCanvas(width,height)
+let uiCanvas=document.getElementById('ui-canvas')
+
+uiCanvas.width=width
+uiCanvas.height=height
+
+let ctx=uiCanvas.getContext('2d')
+let gl=D.getContext(glCanvas,{antialias:1})
+let ext=D.getExtension('EXT_color_buffer_float')
+
+D.viewport(0,0,width,height)
+D.enable3D()
+
+D.floatify=(n)=>n+(Math.floor(n)===n?'.':'')
+
+document.oncontextmenu=(e)=>e.preventDefault()
+
+
+
+
+
+
+let moveSpeed=450
+let moveDamp=6
+
+let renderRaw=false
+let timeMultiplier=1
+let gravity=1
+
+let stirRadius=6
+let stirStrength=5
+
+let GRID_DENSITY=0.5
+let GRID_WIDTH=40
+let GRID_HEIGHT=20
+let GRID_LENGTH=30
+let PARTICLES_PER_CELL=10
+let PARTICLE_SIZE=900
+
+let TRANSLUCENCY=8
+let LIQUID_COLOR=[0,0.5,1]
+let PRESSURE_JACOBI_ITERATIONS=50
+let PIC_FLIP_RATIO=0.95
+
+let spawningBox=[0,0,0,15,GRID_HEIGHT,GRID_LENGTH]
+
+
+
+
+
+
+
+
+let bX=GRID_WIDTH*0.5,bY=GRID_HEIGHT*0.5,bZ=GRID_LENGTH*0.5
+
+let totalVolume=Math.abs(spawningBox[0]-spawningBox[3])*Math.abs(spawningBox[1]-spawningBox[4])*Math.abs(spawningBox[2]-spawningBox[5])
+
+
+let gridCells=GRID_WIDTH*GRID_HEIGHT*GRID_LENGTH*GRID_DENSITY,
+    r=Math.ceil(Math.pow(gridCells*0.5,1/3))
+let gridResolutionX=r
+let gridResolutionY=r
+let gridResolutionZ=r
+let totalGridCells=gridResolutionX*gridResolutionY*gridResolutionZ
+let fractionFilled=totalVolume/(GRID_WIDTH*GRID_HEIGHT*GRID_LENGTH)
+let desiredParticleCount=fractionFilled*totalGridCells*PARTICLES_PER_CELL
+
+let particlesWidth=512
+let particlesHeight=Math.ceil(desiredParticleCount/particlesWidth)
+
+let velocitiesWidth=(gridResolutionX+1)*(gridResolutionZ+1)
+let velocitiesHeight=(gridResolutionY+1)
+
+let scalarWidth=gridResolutionX*gridResolutionZ
+let scalarHeight=gridResolutionY
+
+
+let particlesCount=particlesWidth*particlesHeight
+
+let particleUVs=new Float32Array(particlesCount*2)
+
+for(let y=0;y<particlesHeight;++y)
+    for(let x=0;x<particlesWidth;++x){
+        
+        particleUVs[(y*particlesWidth+x)*2]=(x+0.5)/particlesWidth
+        particleUVs[(y*particlesWidth+x)*2+1]=(y+0.5)/particlesHeight
+    }
+
+let particleVertBuffer=gl.createBuffer()
+gl.bindBuffer(gl.ARRAY_BUFFER,particleVertBuffer)
+gl.bufferData(gl.ARRAY_BUFFER,particleUVs,gl.STATIC_DRAW)
+
+
+let particlePositionsData=new Float32Array(particlesCount*4)
+let particleRandoms=new Float32Array(particlesCount*4)
+for(let i=0;i<particlesCount;++i){
+    
+    let _i=i<<2
+    particlePositionsData[_i]=D.random(spawningBox[0],spawningBox[3])
+    particlePositionsData[_i+1]=D.random(spawningBox[1],spawningBox[4])
+    particlePositionsData[_i+2]=D.random(spawningBox[2],spawningBox[5])
+    particlePositionsData[_i+3]=0
+
+    let theta=Math.random()*2*D.PI,
+        u=Math.random()*2-1,
+        _m=Math.sqrt(1-u*u)
+    particleRandoms[_i]=_m*Math.cos(theta)
+    particleRandoms[_i+1]=_m*Math.sin(theta)
+    particleRandoms[_i+2]=u
+    particleRandoms[_i+3]=0
+}
+
+
+let particlePosition_tex=D.createTexture(particlesWidth,particlesHeight,particlePositionsData,'NEAREST','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    _particlePosition_tex=D.createTexture(particlesWidth,particlesHeight,null,'NEAREST','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    particleVelocity_tex=D.createTexture(particlesWidth,particlesHeight,null,'NEAREST','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    _particleVelocity_tex=D.createTexture(particlesWidth,particlesHeight,null,'NEAREST','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    particleRandom_tex=D.createTexture(particlesWidth,particlesHeight,particleRandoms,'NEAREST','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    
+    velocity_tex=D.createTexture(velocitiesWidth,velocitiesHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    _velocity_tex=D.createTexture(velocitiesWidth,velocitiesHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    originalVelocity_tex=D.createTexture(velocitiesWidth,velocitiesHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    weight_tex=D.createTexture(velocitiesWidth,velocitiesHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+
+    marker_tex=D.createTexture(scalarWidth,scalarHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA','RGBA','UNSIGNED_BYTE'),
+    divergence_tex=D.createTexture(scalarWidth,scalarHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    pressure_tex=D.createTexture(scalarWidth,scalarHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    _pressure_tex=D.createTexture(scalarWidth,scalarHeight,null,'LINEAR','CLAMP_TO_EDGE','RGBA16F','RGBA','FLOAT'),
+    
+    weight_fb=D.createFramebuffer(weight_tex),
+    _velocity_fb=D.createFramebuffer(_velocity_tex),
+    velocity_fb=D.createFramebuffer(velocity_tex),
+    marker_fb=D.createFramebuffer(marker_tex),
+    originalVelocity_fb=D.createFramebuffer(originalVelocity_tex),
+    divergence_fb=D.createFramebuffer(divergence_tex),
+    pressure_fb=D.createFramebuffer(pressure_tex),
+    _pressure_fb=D.createFramebuffer(_pressure_tex),
+    particleVelocity_fb=D.createFramebuffer(particleVelocity_tex),
+    _particleVelocity_fb=D.createFramebuffer(_particleVelocity_tex),
+    particlePosition_fb=D.createFramebuffer(particlePosition_tex),
+    _particlePosition_fb=D.createFramebuffer(_particlePosition_tex),
+    
+    
+    normals_tex=D.createTexture(width,height,null,'LINEAR','CLAMP_TO_EDGE','RGBA','RGBA','UNSIGNED_BYTE'),
+    horBlur_tex=D.createTexture(width,height,null,'LINEAR','CLAMP_TO_EDGE','RGBA','RGBA','UNSIGNED_BYTE'),
+    verBlur_tex=D.createTexture(width,height,null,'LINEAR','CLAMP_TO_EDGE','RGBA','RGBA','UNSIGNED_BYTE'),
+    thickness_tex=D.createTexture(halfWidth,halfHeight,null,'LINEAR','CLAMP_TO_EDGE','R16F','RED','FLOAT'),
+    thicknessHorBlur_tex=D.createTexture(halfWidth,halfHeight,null,'LINEAR','CLAMP_TO_EDGE','R16F','RED','FLOAT'),
+    thicknessVerBlur_tex=D.createTexture(halfWidth,halfHeight,null,'LINEAR','CLAMP_TO_EDGE','R16F','RED','FLOAT'),
+    finalRender_tex=D.createTexture(width,height,null,'LINEAR','CLAMP_TO_EDGE','RGBA','RGBA','UNSIGNED_BYTE'),
+    
+    normals_fb=D.createFramebuffer(normals_tex,true),
+    horBlur_fb=D.createFramebuffer(horBlur_tex),
+    verBlur_fb=D.createFramebuffer(verBlur_tex),
+    thickness_fb=D.createFramebuffer(thickness_tex),
+    thicknessHorBlur_fb=D.createFramebuffer(thicknessHorBlur_tex),
+    thicknessVerBlur_fb=D.createFramebuffer(thicknessVerBlur_tex),
+    finalRender_fb=D.createFramebuffer(finalRender_tex)
+
+
+D.bindFramebuffer(null)
+
+//{
+let _gridSize=`
+vec3 gridSize=vec3(${GRID_WIDTH+','+GRID_HEIGHT+','+GRID_LENGTH});`,
+    _gridResolution=`
+vec3 gridResolution=vec3(${gridResolutionX+','+gridResolutionY+','+gridResolutionZ});`,
+
+    _get3DFragCoord=`
+vec3 get3DFragCoord(vec3 resolution){
+    return vec3(
+        mod(gl_FragCoord.x,resolution.x),
+        gl_FragCoord.y,
+        floor(gl_FragCoord.x/resolution.x)+0.5);
+}`,
+    _texture3D=`
+vec4 texture3D(sampler2D tex,vec3 coordinates,vec3 resolution){
+    vec3 fullCoordinates=coordinates*resolution;
+
+    fullCoordinates=clamp(fullCoordinates,vec3(0.5),vec3(resolution-0.5));
+
+    float belowZIndex=floor(fullCoordinates.z-0.5);
+    float aboveZIndex=belowZIndex+1.0; 
+
+    float fraction=fract(fullCoordinates.z-0.5);
+
+    vec2 belowCoordinates=vec2(
+        belowZIndex*resolution.x+fullCoordinates.x,
+        fullCoordinates.y)/vec2(resolution.x*resolution.z,resolution.y);
+
+    vec2 aboveCoordinates=vec2(
+        aboveZIndex*resolution.x+fullCoordinates.x,
+        fullCoordinates.y)/vec2(resolution.x*resolution.z,resolution.y);
+
+    return mix(texture(tex,belowCoordinates),texture(tex,aboveCoordinates),fraction);
+}`,
+_texture3DNearest=`
+vec4 texture3DNearest(sampler2D tex,vec3 coordinates,vec3 resolution){
+    vec3 fullCoordinates=coordinates*resolution;
+
+    fullCoordinates=clamp(fullCoordinates,vec3(0.5),vec3(resolution-0.5));
+
+    float zIndex=floor(fullCoordinates.z);
+
+    vec2 textureCoordinates=vec2(
+        zIndex*resolution.x+fullCoordinates.x,
+        fullCoordinates.y)/vec2(resolution.x*resolution.z,resolution.y);
+
+    return texture(tex,textureCoordinates);
+}`
+
+//}
+
+let convertToGrid_pro=D.createProgram(`#version 300 es
+precision mediump float;
+    
+    in vec2 vertPos;
+    
+    out vec2 pixUV;
+    
+    uniform sampler2D positionTexture;
+    uniform sampler2D velocityTexture;
+    
+    uniform float zOffset;
+    
+    out vec3 pixPosition;
+    out vec3 pixVelocity;
+    out float pixZIndex;
+    
+    ${_gridSize}
+    ${_gridResolution}
+    
+    void main(){
+        
+        gl_PointSize=3.0;
+        vec3 position=texture(positionTexture,vertPos).rgb;
+        position=(position/gridSize)*gridResolution;
+        vec3 velocity=texture(velocityTexture,vertPos).rgb;
+        pixVelocity=velocity;
+        pixPosition=position;
+        
+        vec3 cellIndex=vec3(floor(position));
+        pixZIndex=cellIndex.z+zOffset;
+        
+        vec2 textureCoordinates=vec2(pixZIndex*(gridResolution.x+1.0)+cellIndex.x+0.5,cellIndex.y+0.5)/vec2((gridResolution.x+1.0)*(gridResolution.z+1.0),gridResolution.y+1.0);
+        
+        gl_Position=vec4(textureCoordinates*2.0-1.0,0,1);
+    }
+
+`,`#version 300 es
+precision mediump float;
+
+    in vec3 pixPosition;
+    in vec3 pixVelocity;
+    in float pixZIndex;
+    
+    uniform int accumulate;
+    
+    float h(float r){
+        if(r>=0.0&&r<=1.0){
+            return 1.0-r;
+        }else if(r>=-1.0&&r<=0.0){
+            return 1.0+r;
+        }else{
+            return 0.0;
+        }
+    }
+    
+    float k(vec3 v){
+        return h(v.x)*h(v.y)*h(v.z);
+    }
+    
+    ${_gridResolution}
+    
+    ${_get3DFragCoord}
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 cellIndex=floor(get3DFragCoord(gridResolution+1.0));
+    
+        if(cellIndex.z==pixZIndex){
+            
+            vec3 xPosition=vec3(cellIndex.x,cellIndex.y+0.5,cellIndex.z+0.5);
+            float xWeight=k(pixPosition-xPosition);
+            
+            vec3 yPosition=vec3(cellIndex.x+0.5,cellIndex.y,cellIndex.z+0.5);
+            float yWeight=k(pixPosition-yPosition);
+            
+            vec3 zPosition=vec3(cellIndex.x+0.5,cellIndex.y+0.5,cellIndex.z);
+            float zWeight=k(pixPosition-zPosition);
+            
+            vec3 scalarPosition=vec3(cellIndex.x+0.5,cellIndex.y+0.5,cellIndex.z+0.5);
+            float scalarWeight=k(pixPosition-scalarPosition);
+            
+            if(accumulate==0){
+                FragColor=vec4(xWeight,yWeight,zWeight,scalarWeight);
+            }else if(accumulate==1){
+                FragColor=vec4(xWeight*pixVelocity.x,yWeight*pixVelocity.y,zWeight*pixVelocity.z,0);
+            }
+            
+        }else{
+            FragColor=vec4(0,0,0,0);
+        }
+    }
+`,1),
+
+    normalizeGrid_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D accumulatedVelocityTexture;
+    uniform sampler2D weightTexture;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 accumulatedVelocity=texture(accumulatedVelocityTexture,pixUV).rgb;
+        vec3 weight=texture(weightTexture,pixUV).rgb;
+    
+        float xVelocity=0.0;
+        if(weight.x>0.0)
+            xVelocity=accumulatedVelocity.x/weight.x;
+    
+        float yVelocity=0.0;
+        if(weight.y>0.0)
+            yVelocity=accumulatedVelocity.y/weight.y;
+    
+        float zVelocity=0.0;
+        if(weight.z>0.0)
+            zVelocity=accumulatedVelocity.z/weight.z;
+    
+        FragColor=vec4(xVelocity,yVelocity,zVelocity,0);
+    }
+`,1),
+
+    marker_pro=D.createProgram(`#version 300 es
+precision mediump float;
+    
+    in vec2 vertPos;
+    
+    uniform sampler2D positionTexture;
+    
+    ${_gridSize}
+    ${_gridResolution}
+    
+    void main(){
+        
+        gl_PointSize=1.0;
+        
+        vec3 position=texture(positionTexture,vertPos).rgb;
+        position=(position/gridSize)*gridResolution;
+        vec3 cellIndex=floor(position);
+        
+        vec2 textureCoordinates=vec2(cellIndex.z*gridResolution.x+cellIndex.x+0.5,cellIndex.y+0.5)/vec2(gridResolution.x*gridResolution.z,gridResolution.y);
+        
+        gl_Position=vec4(textureCoordinates*2.0-1.0,0,1);
+    }
+`,`#version 300 es
+precision mediump float;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        FragColor=vec4(1);
+    }
+`,1),
+    copy_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D tex;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        FragColor=texture(tex,pixUV);
+    }
+`,1),
+    addForce_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D velocityTexture;
+
+    uniform vec3 mouseVelocity;
+    uniform vec3 mouseRayOrigin;
+    uniform vec3 mouseRayDirection;
+    
+    uniform float dt;
+    
+    ${_gridSize}
+    ${_gridResolution}
+    ${_get3DFragCoord}
+    
+    float kernel(vec3 position,float radius){
+        vec3 worldPosition=(position/gridResolution)*gridSize;
+    
+        float distanceToMouseRay=length(cross(mouseRayDirection,worldPosition-mouseRayOrigin));
+    
+        float normalizedDistance=max(0.0,distanceToMouseRay/radius);
+        return smoothstep(1.0,0.9,normalizedDistance);
+    }
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 velocity=texture(velocityTexture,pixUV).rgb+vec3(0,${D.floatify(-40.0*gravity)}*dt,0);
+    
+        vec3 cellIndex=floor(get3DFragCoord(gridResolution+1.0));
+        vec3 xPosition=vec3(cellIndex.x,cellIndex.y+0.5,cellIndex.z+0.5);
+        vec3 yPosition=vec3(cellIndex.x+0.5,cellIndex.y,cellIndex.z+0.5);
+        vec3 zPosition=vec3(cellIndex.x+0.5,cellIndex.y+0.5,cellIndex.z);
+        
+        float mouseRadius=${D.floatify(stirRadius)};
+        vec3 kernelValues=vec3(kernel(xPosition,mouseRadius),kernel(yPosition,mouseRadius),kernel(zPosition,mouseRadius));
+    
+        velocity+=mouseVelocity*kernelValues*${D.floatify(stirStrength)}*smoothstep(0.0,0.005,dt);
+        
+        if(cellIndex.x<0.5)
+            velocity.x=0.0;
+        
+        if(cellIndex.x>gridResolution.x-0.5)
+            velocity.x=0.0;
+        
+        if(cellIndex.y<0.5)
+            velocity.y=0.0;
+        
+        if(cellIndex.y>gridResolution.y-0.5)
+            velocity.y=min(velocity.y,0.0);
+        
+        if(cellIndex.z<0.5)
+            velocity.z=0.0;
+        
+        if(cellIndex.z>gridResolution.z-0.5)
+            velocity.z=0.0;
+        
+        FragColor=vec4(velocity,0);
+    }
+`,1),
+    divergence_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D velocityTexture;
+    uniform sampler2D markerTexture;
+    uniform sampler2D weightTexture;
+    
+    ${_gridResolution}
+    ${_texture3DNearest}
+    ${_get3DFragCoord}
+    float maxDensity=${D.floatify(PARTICLES_PER_CELL)};
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 cellIndex=floor(get3DFragCoord(gridResolution));
+    
+        float fluidCell=texture3DNearest(markerTexture,(cellIndex+0.5)/gridResolution,gridResolution).x;
+        
+        if(fluidCell==0.0)discard;
+        
+        float leftX=texture3DNearest(velocityTexture,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).x;
+        float rightX=texture3DNearest(velocityTexture,(cellIndex+vec3(1.0,0.0,0.0)+0.5)/(gridResolution+1.0),gridResolution+1.0).x;
+    
+        float bottomY=texture3DNearest(velocityTexture,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).y;
+        float topY=texture3DNearest(velocityTexture,(cellIndex+vec3(0.0,1.0,0.0)+0.5)/(gridResolution+1.0),gridResolution+1.0).y;
+    
+        float backZ=texture3DNearest(velocityTexture,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).z;
+        float frontZ=texture3DNearest(velocityTexture,(cellIndex+vec3(0.0,0.0,1.0)+0.5)/(gridResolution+1.0),gridResolution+1.0).z;
+    
+        float divergence=((rightX-leftX)+(topY-bottomY)+(frontZ-backZ));
+    
+        float density=texture3DNearest(weightTexture,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).a;
+        
+        divergence-=max((density-maxDensity),0.0);
+        
+        FragColor=vec4(divergence,1,0,0);
+    }
+`,1),
+    jacobi_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+
+    uniform sampler2D divergenceTexture;
+    uniform sampler2D markerTexture;
+    uniform sampler2D pressureTexture;
+    
+    ${_gridResolution}
+    ${_get3DFragCoord}
+    ${_texture3DNearest}
+    
+    out vec4 FragColor;
+    
+    vec3 delta=1.0/vec3(${gridResolutionX},${gridResolutionY},${gridResolutionZ});
+    
+    void main(){
+        
+        vec3 centerCoords=get3DFragCoord(gridResolution)/gridResolution;
+        
+        float fluidCell=texture3DNearest(markerTexture,centerCoords,gridResolution).x;
+        if(fluidCell==0.0)discard;
+        
+        float divergenceCenter=texture3DNearest(divergenceTexture,centerCoords,gridResolution).r;
+        
+        float left=texture3DNearest(pressureTexture,centerCoords+vec3(-delta.x,0.0,0.0),gridResolution).r;
+        float right=texture3DNearest(pressureTexture,centerCoords+vec3(delta.x,0.0,0.0),gridResolution).r;
+        float bottom=texture3DNearest(pressureTexture,centerCoords+vec3(0.0,-delta.y,0.0),gridResolution).r;
+        float top=texture3DNearest(pressureTexture,centerCoords+vec3(0.0,delta.y,0.0),gridResolution).r;
+        float back=texture3DNearest(pressureTexture,centerCoords+vec3(0.0,0.0,-delta.z),gridResolution).r;
+        float front=texture3DNearest(pressureTexture,centerCoords+vec3(0.0,0.0,delta.z),gridResolution).r;
+        
+        float newPressure=(left+right+bottom+top+back+front-divergenceCenter)/6.0;
+        
+        FragColor=vec4(newPressure,0,0,0);
+    }
+`,1),
+    subtract_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D pressureTexture;
+    uniform sampler2D velocityTexture;
+    
+    ${_gridResolution}
+    ${_get3DFragCoord}
+    ${_texture3DNearest}
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 cellIndex=floor(get3DFragCoord(gridResolution+1.0));
+    
+        float left=texture3DNearest(pressureTexture,(cellIndex+vec3(-1.0,0.0,0.0)+0.5)/gridResolution,gridResolution).r;
+        float right=texture3DNearest(pressureTexture,(cellIndex+0.5)/gridResolution,gridResolution).r;
+    
+        float bottom=texture3DNearest(pressureTexture,(cellIndex+vec3(0.0,-1.0,0.0)+0.5)/gridResolution,gridResolution).r;
+        float top=texture3DNearest(pressureTexture,(cellIndex+0.5)/gridResolution,gridResolution).r;
+    
+        float back=texture3DNearest(pressureTexture,(cellIndex+vec3(0.0,0.0,-1.0)+0.5)/gridResolution,gridResolution).r;
+        float front=texture3DNearest(pressureTexture,(cellIndex+0.5)/gridResolution,gridResolution).r;
+        
+        vec3 gradient=vec3(right-left,top-bottom,front-back);
+        
+        vec3 currentVelocity=texture(velocityTexture,pixUV).rgb;
+        
+        vec3 newVelocity=currentVelocity-gradient;
+        
+        FragColor=vec4(newVelocity,0);
+    }
+`,1),
+    transferToParticles_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D particlePositionTexture;
+    uniform sampler2D particleVelocityTexture;
+    uniform sampler2D gridVelocityTexture;
+    uniform sampler2D originalGridVelocityTexture;
+    
+    
+    ${_gridResolution}
+    ${_gridSize}
+    ${_texture3D}
+    
+    float sampleXVelocity(sampler2D tex,vec3 position){
+        vec3 cellIndex=vec3(position.x,position.y-0.5,position.z-0.5);
+        return texture3D(tex,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).x;
+    }
+    
+    float sampleYVelocity(sampler2D tex,vec3 position){
+        vec3 cellIndex=vec3(position.x-0.5,position.y,position.z-0.5);
+        return texture3D(tex,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).y;
+    }
+    
+    float sampleZVelocity(sampler2D tex,vec3 position){
+        vec3 cellIndex=vec3(position.x-0.5,position.y-0.5,position.z);
+        return texture3D(tex,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).z;
+    }
+    
+    vec3 sampleVelocity(sampler2D tex,vec3 position){
+        return vec3(sampleXVelocity(tex,position),sampleYVelocity(tex,position),sampleZVelocity(tex,position));
+    }
+    
+    
+    float flipness=${D.floatify(PIC_FLIP_RATIO)};
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 particlePosition=texture(particlePositionTexture,pixUV).rgb;
+        particlePosition=(particlePosition/gridSize)*gridResolution;
+    
+        vec3 particleVelocity=texture(particleVelocityTexture,pixUV).rgb;
+    
+        vec3 currentVelocity=sampleVelocity(gridVelocityTexture,particlePosition);
+        vec3 originalVelocity=sampleVelocity(originalGridVelocityTexture,particlePosition);
+    
+        vec3 velocityChange=currentVelocity-originalVelocity;
+    
+        vec3 flipVelocity=particleVelocity+velocityChange;
+        vec3 picVelocity=currentVelocity;
+    
+        FragColor=vec4(mix(picVelocity,flipVelocity,flipness),1);
+    }
+`,1),
+    advect_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D positionsTexture;
+    uniform sampler2D randomsTexture;
+    uniform sampler2D velocityGrid;
+    
+    uniform float dt;
+    uniform float frameNumber;
+    
+    ${_gridResolution}
+    ${_gridSize}
+    ${_texture3D}
+    vec2 particlesResolution=vec2(${particlesWidth},${particlesHeight});
+    
+    float sampleXVelocity(vec3 position){
+        vec3 cellIndex=vec3(position.x,position.y-0.5,position.z-0.5);
+        return texture3D(velocityGrid,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).x;
+    }
+    
+    float sampleYVelocity(vec3 position){
+        vec3 cellIndex=vec3(position.x-0.5,position.y,position.z-0.5);
+        return texture3D(velocityGrid,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).y;
+    }
+    
+    float sampleZVelocity(vec3 position){
+        vec3 cellIndex=vec3(position.x-0.5,position.y-0.5,position.z);
+        return texture3D(velocityGrid,(cellIndex+0.5)/(gridResolution+1.0),gridResolution+1.0).z;
+    }
+    
+    vec3 sampleVelocity(vec3 position){
+        vec3 gridPosition=(position/gridSize)*gridResolution;
+        return vec3(sampleXVelocity(gridPosition),sampleYVelocity(gridPosition),sampleZVelocity(gridPosition));
+    }
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 position=texture(positionsTexture,pixUV).rgb;
+        vec3 randomDirection=texture(randomsTexture,fract(pixUV+frameNumber/particlesResolution)).rgb;
+        
+        vec3 velocity=sampleVelocity(position);
+        
+        vec3 halfwayPosition=position+velocity*dt*0.5;
+        vec3 halfwayVelocity=sampleVelocity(halfwayPosition);
+        
+        vec3 step=halfwayVelocity*dt;
+        
+        step+=0.05*randomDirection*length(velocity)*dt;
+        
+        vec3 newPosition=position+step;
+        
+        newPosition=clamp(newPosition,vec3(0.01),gridSize-0.01);
+        
+        FragColor=vec4(newPosition,1);
+    }
+`,1),
+    surfaceRenderer_pro=D.createProgram(`#version 300 es
+precision mediump float;
+
+    in vec2 vertPos;
+    
+    uniform sampler2D positionTexture;
+    uniform mat4 viewMatrix;
+    
+    out float particleSize;
+    out vec2 particlePos;
+    
+    void main(){
+        
+        vec3 position=texture(positionTexture,vertPos).rgb;
+        
+        vec4 pos=viewMatrix*vec4(position,1);
+        particlePos=pos.xy/pos.w;
+        gl_Position=pos;
+        float projSize=min(${D.floatify(PARTICLE_SIZE)}/pos.z,250.0);
+        gl_PointSize=projSize;
+        particleSize=projSize*0.5;
+    }
+`,`#version 300 es
+precision mediump float;
+
+    in float particleSize;
+    in vec2 particlePos;
+    
+    uniform mat4 cameraMatrixTranspose;
+    
+    out vec4 FragColor;
+    
+    vec2 halfScreen=vec2(${width*0.5},${height*0.5});
+    vec2 invHalfScreen=1.0/vec2(${width*0.5},${height*0.5});
+    float invAvgHalfWidthHeight=${D.floatify(4/(width+height))};
+    
+    void main(){
+        
+        vec2 del=particlePos-(gl_FragCoord.xy-halfScreen)*invHalfScreen;
+        
+        float rad=particleSize*invAvgHalfWidthHeight;
+        float radSq=rad*rad;
+        float pixDistSq=del.x*del.x+del.y*del.y;
+        
+        if(pixDistSq>radSq)
+            discard;
+        
+        float c=smoothstep(1.0,0.0,pixDistSq/radSq);
+        
+        FragColor=vec4(0,c*0.4,c,1);
+        
+        del/=rad;
+        
+        float zVal=sqrt(1.1-del.x*del.x-del.y*del.y);
+        vec3 normal=normalize(mat3(cameraMatrixTranspose)*vec3(-del,zVal));
+        
+        gl_FragDepth=gl_FragCoord.z-(sqrt(1.0-dot(del,del))*rad)*${D.floatify(1/PARTICLE_SIZE)};
+        FragColor=vec4(normal*0.5+0.5,pow(gl_FragDepth,850.0));
+    }
+`,1),
+    thicknessRenderer_pro=D.createProgram(`#version 300 es
+precision mediump float;
+
+    in vec2 vertPos;
+    
+    uniform sampler2D positionTexture;
+    uniform mat4 viewMatrix;
+    
+    out float particleSize;
+    out vec2 particlePos;
+    
+    void main(){
+        
+        vec3 position=texture(positionTexture,vertPos).rgb;
+        
+        vec4 pos=viewMatrix*vec4(position,1);
+        particlePos=pos.xy/pos.w;
+        gl_Position=pos;
+        float projSize=min(${D.floatify(PARTICLE_SIZE)}/pos.z,250.0);
+        gl_PointSize=projSize;
+        particleSize=projSize*0.5;
+    }
+`,`#version 300 es
+precision mediump float;
+
+    in float particleSize;
+    in vec2 particlePos;
+    
+    out vec4 FragColor;
+    
+    vec2 halfScreen=vec2(${halfWidth*0.5},${halfHeight*0.5});
+    vec2 invHalfScreen=1.0/vec2(${halfWidth*0.5},${halfHeight*0.5});
+    float invAvgHalfWidthHeight=${D.floatify(4/(halfWidth+halfHeight))};
+    
+    void main(){
+        
+        vec2 del=particlePos-(gl_FragCoord.xy-halfScreen)*invHalfScreen;
+        
+        float rad=particleSize*invAvgHalfWidthHeight;
+        
+        if(del.x*del.x+del.y*del.y>rad*rad)
+            discard;
+        
+        FragColor=vec4(0.002,0,0,1);
+        
+    }
+`,1),
+    horBlur_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D tex;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 accum=vec3(0);
+        float weight=0.0;
+        
+        vec4 center=texture(tex,pixUV);
+        float depth=center.a;
+        
+        for(int i=-15;i<=15;i++){
+            
+            vec4 sam=texture(tex,pixUV+vec2(i,0)*${D.floatify(1/width)});
+            vec3 col=sam.rgb;
+            
+            if(sam.w>=0.0){
+                float samWeight=exp(-30.0*abs(depth-sam.w));
+                weight+=samWeight;
+                accum+=col*samWeight;
+                
+            }else{
+                weight+=1.0;
+                accum+=center.rgb;
+            }
+        }
+        
+        FragColor=vec4(accum/weight,depth);
+        // FragColor=vec4(texture(tex,pixUV).rgb,1);
+    }
+`,1),
+    verBlur_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D tex;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 accum=vec3(0);
+        float weight=0.0;
+        
+        vec4 center=texture(tex,pixUV);
+        float depth=center.a;
+        
+        for(int i=-15;i<=15;i++){
+            
+            vec4 sam=texture(tex,pixUV+vec2(0,i)*${D.floatify(1/height)});
+            vec3 col=sam.rgb;
+            
+            if(sam.w>=0.0){
+                
+                float samWeight=exp(-30.0*abs(depth-sam.w));
+                weight+=samWeight;
+                accum+=col*samWeight;
+                
+            }else{
+                weight+=1.0;
+                accum+=center.rgb;
+            }
+        }
+        
+        FragColor=vec4(accum/weight,1);
+        // FragColor=vec4(texture(tex,pixUV).rgb,1);
+    }
+`,1),
+    lightHorBlur_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D tex;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        float accum=0.0;
+        
+        for(int i=-3;i<=3;i++)
+            accum+=texture(tex,pixUV+vec2(i,0)*${D.floatify(4/width)}).r;
+        
+        FragColor=vec4(accum*0.1,0,0,1);
+    }
+`,1),
+    lightVerBlur_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D tex;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        float accum=0.0;
+        
+        for(int i=-5;i<=5;i++)
+            accum+=texture(tex,pixUV+vec2(0,i)*${D.floatify(4/height)}).r;
+        
+        FragColor=vec4(accum*0.1,0,0,1);
+    }
+`,1),
+    final_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D stencilTex;
+    uniform sampler2D normalTex;
+    uniform sampler2D thicknessTex;
+    uniform vec3 camDir;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        vec3 sten=texture(stencilTex,pixUV).rgb;
+        if(dot(sten,sten)<=0.0)discard;
+        
+        vec3 normal=normalize(texture(normalTex,pixUV).rgb*2.0-1.0);
+        float thickness=texture(thicknessTex,pixUV).r;
+        
+        float alpha=exp(${D.floatify(TRANSLUCENCY/(particlesCount/totalVolume))}*-thickness);
+        
+        vec3 col=mix(vec3(${LIQUID_COLOR})*(normal.y*0.3+0.7),vec3(0),alpha);
+        
+        float viewShear=1.0/max(abs(camDir.y),0.01);
+        
+        vec3 d=reflect(vec3(0,1,0),normal);
+        
+        //no idea how i stumbled upon this but it looks realer than whatever other things there are. sadly has a few flaws but otherwise looks slay
+        float spec=pow(clamp(dot(-camDir,d)*0.5+pow(fract(sin(normal.x*10.0*viewShear)*sin(normal.z*10.0*viewShear)),100.0),0.0,1.0),200.0);
+        
+        alpha=1.0-alpha;
+        
+        FragColor=vec4(col+spec*0.75*alpha,1);
+    }
+`,1),
+    view_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`#version 300 es
+precision mediump float;
+
+    in vec2 pixUV;
+    
+    uniform sampler2D tex;
+    
+    out vec4 FragColor;
+    
+    void main(){
+        
+        FragColor=vec4(texture(tex,pixUV).rgb,1);
+    }
+`,1),
+    DBAA_pro=D.createProgram(D.DEFAULT_POST_PROCESSING_VSH,`
+#version 300 es
+precision mediump float;
+
+in vec2 pixUV;
+
+uniform sampler2D tex;
+
+out vec4 FragColor;
+
+vec4 getCol(vec2 uv){
+    vec3 c=texture(tex,uv).rgb;
+    return vec4(c,dot(c,vec3(0.299,0.587,0.114)));
+}
+
+const float range=5.;
+const vec2 pix=1.0/vec2(${width},${height});
+const float bias=0.05;
+
+vec3 DirectionalBlendingAntiAliasing(vec2 pixUV){
+    vec4 thisCol=getCol(pixUV);
+    float thisABiased=thisCol.a+bias;
+    vec3 finalCol=thisCol.rgb;
+    vec4 leftCol=getCol(pixUV+vec2(-pix.x,0));
+    vec4 rightCol=getCol(pixUV+vec2(pix.x,0));
+    vec4 topCol=getCol(pixUV+vec2(0,pix.y));
+    vec4 bottomCol=getCol(pixUV+vec2(0,-pix.y));
+    
+    if(topCol.a>thisABiased){
+        vec2 ss=vec2(range,range);
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(i*pix.x,pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(pix.x*(i+1.),0));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(-i*pix.x,pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(pix.x*-(i+1.),0));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        finalCol=mix(finalCol,topCol.rgb,((ss.y-ss.x)/max(ss.x,ss.y))*0.5+0.5);
+    }else
+    if(bottomCol.a>thisABiased){
+        vec2 ss=vec2(range,range);
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(i*pix.x,-pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(pix.x*(i+1.),0));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(-i*pix.x,-pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(pix.x*-(i+1.),0));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        finalCol=mix(finalCol,bottomCol.rgb,((ss.y-ss.x)/max(ss.x,ss.y))*0.5+0.5);
+    }
+    if(leftCol.a>thisABiased){
+        vec2 ss=vec2(range,range);
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(-pix.x,i*pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(0,pix.y*(i+1.)));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(-pix.x,-i*pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(0,pix.y*-(i+1.)));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        finalCol=mix(finalCol,leftCol.rgb,((ss.y-ss.x)/max(ss.x,ss.y))*0.5+0.5);
+    }else
+    if(rightCol.a>thisABiased){
+        vec2 ss=vec2(range,range);
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(pix.x,i*pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(0,pix.y*(i+1.)));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        for(float i=1.;i<=range;i++){
+            vec4 adjacent=getCol(pixUV+vec2(pix.x,-i*pix.y));
+            if(adjacent.a>thisABiased){
+                vec4 forward=getCol(pixUV+vec2(0,pix.y*-(i+1.)));
+                if(abs(forward.a-adjacent.a)<bias&&forward.a>thisCol.a){
+                    ss.x=i;
+                    break;
+                }
+            }else{
+                ss.y=i;
+                break;
+            }
+        }
+        finalCol=mix(finalCol,rightCol.rgb,((ss.y-ss.x)/max(ss.x,ss.y))*0.5+0.5);
+    }
+    return finalCol;
+}
+void main(){
+    
+    FragColor=vec4(DirectionalBlendingAntiAliasing(pixUV),1);
+    
+}`,1)
+
+
+let screenMesh=D.createMesh(D.createMeshData({meshes:[{type:'plane',x:0,y:0,z:0,size:2,r:0,g:0,b:0,rx:90,ry:0,rz:0}],order:['x','y'],vl:0}),[['vertPos',2,8,0]])
+
+
+let proj=D.perspectiveMatrix(50,aspect,0.1,200),mat=D.createIdentityMatrix(),TIME=0,then=performance.now(),dt,x=bX,y=bY,z=Math.max(bX,bY)*4,yaw=0,pitch=0,sense=0.005,vx=0,vy=0,vz=0
+
+let mouseDown,viewInfo,
+    mouseVelocity=[0,0,0],
+    mouseRayDirection=[0,0,0],
+    lastMousePlanePos=[0,0],
+    keys={}
+
+document.onkeydown=(e)=>{
+    keys[e.key.toLowerCase()]=1
+    
+    if(e.key=='p'){
+        if(!timeMultiplier)timeMultiplier=window._timeMultiplier||0
+        window._timeMultiplier=timeMultiplier+0
+        timeMultiplier=0
+    }
+    if(e.key!='t')return
+    let w=window.open()
+    w.document.open()
+    w.document.write('<!doctype html><html>'+document.querySelector('html').innerHTML)
+    w.document.close()
+}
+document.onkeyup=(e)=>keys[e.key.toLowerCase()]=0
+
+uiCanvas.onmousedown=(e)=>{
+    if(!(mouseDown=e.button))
+        uiCanvas.requestPointerLock()
+}
+uiCanvas.onmouseup=(e)=>{
+    mouseDown=null
+}
+uiCanvas.onkeydown=(e)=>{
+    keys[e.key.toLowerCase()]=1
+}
+
+uiCanvas.onmousemove=(e)=>{
+    
+    if(mouseDown==0||document.pointerLockElement===uiCanvas){
+        
+        yaw+=e.movementX*sense
+        pitch=D.constrain(pitch+e.movementY*sense,-D.HALF_PI,D.HALF_PI)
+    }
+    
+    let mx=e.x/width,my=1-(e.y/height)
+    mx=mx*2-1
+    my=my*2-1
+    
+    let distance=Math.sqrt((bX-x)*(bX-x)+(bY-y)*(bY-y)+(bZ-z)*(bZ-z)),
+        viewSpaceMouseRay=[mx*aspect/proj[5],my/proj[5],-1],
+        planeX=viewSpaceMouseRay[0]*distance,
+        planeY=viewSpaceMouseRay[1]*distance,
+        mouseVelX=planeX-lastMousePlanePos[0],
+        mouseVelY=planeY-lastMousePlanePos[1],
+        camMat=viewInfo.modelMatrix
+        
+    vec3.transformMat4(mouseRayDirection,viewSpaceMouseRay,camMat)
+    
+    vec3.normalize(mouseRayDirection,mouseRayDirection)
+    
+    lastMousePlanePos[0]=planeX
+    lastMousePlanePos[1]=planeY
+    
+    mat4.invert(camMat,camMat)
+    
+    let camRight=[camMat[0],camMat[4],camMat[8]],
+        camUp=[camMat[1],camMat[5],camMat[9]]
+    
+    if(mouseDown==2||keys.m){
+        document.exitPointerLock()
+        mouseVelocity[0]=mouseVelX*camRight[0]+mouseVelY*camUp[0]
+        mouseVelocity[1]=mouseVelX*camRight[1]+mouseVelY*camUp[1]
+        mouseVelocity[2]=mouseVelX*camRight[2]+mouseVelY*camUp[2]
+    }else
+        mouseVelocity=[0,0,0]
+    
+}
+
+
+D.useProgram(convertToGrid_pro)
+D.setUniform('positionTexture',1)
+D.setUniform('velocityTexture',0)
+
+D.useProgram(normalizeGrid_pro)
+D.setUniform('accumulatedVelocityTexture',1)
+D.setUniform('weightTexture',0)
+
+D.useProgram(divergence_pro)
+D.setUniform('velocityTexture',2)
+D.setUniform('markerTexture',1)
+D.setUniform('weightTexture',0)
+
+D.useProgram(jacobi_pro)
+D.setUniform('divergenceTexture',2)
+D.setUniform('markerTexture',1)
+D.setUniform('pressureTexture',0)
+
+D.useProgram(subtract_pro)
+D.setUniform('pressureTexture',1)
+D.setUniform('velocityTexture',0)
+
+D.useProgram(transferToParticles_pro)
+D.setUniform('particlePositionTexture',3)
+D.setUniform('particleVelocityTexture',2)
+D.setUniform('gridVelocityTexture',1)
+D.setUniform('originalGridVelocityTexture',0)
+
+D.useProgram(advect_pro)
+D.setUniform('positionsTexture',2)
+D.setUniform('randomsTexture',1)
+D.setUniform('velocityGrid',0)
+
+D.useProgram(final_pro)
+D.setUniform('stencilTex',2)
+D.setUniform('normalTex',1)
+D.setUniform('thicknessTex',0)
+
+    
+gl.clearColor(0,0,0,1)
+
+gl.blendEquation(gl.FUNC_ADD)
+gl.blendFuncSeparate(gl.ONE,gl.ONE,gl.ONE,gl.ONE)
+
+
+let frameCount=0
+function loop(now){
+    
+    frameCount++
+    dt=D.constrain((now-then)*0.001,0,0.05)
+    let timeStep=dt*timeMultiplier
+    TIME+=dt
+    
+    let sinYaw=Math.sin(yaw),cosYaw=Math.cos(yaw),dx=0,dy=0,dz=0
+    
+    if(keys.w){
+        dx+=sinYaw
+        dz-=cosYaw
+    }
+    if(keys.s){
+        dx-=sinYaw
+        dz+=cosYaw
+    }
+    if(keys.a){
+        dx-=cosYaw
+        dz-=sinYaw
+    }
+    if(keys.d){
+        dx+=cosYaw
+        dz+=sinYaw
+    }
+    if(keys[' '])
+        dy+=1
+    if(keys.shift)
+        dy-=1
+    
+    let d=1/(dt*moveDamp+1),dm=dt*moveSpeed/(Math.sqrt(dx*dx+dy*dy+dz*dz)||1)
+    vx=(vx+dx*dm)*d
+    vy=(vy+dy*dm)*d
+    vz=(vz+dz*dm)*d
+    x+=vx*dt
+    y+=vy*dt
+    z+=vz*dt
+    
+    
+    viewInfo=D.setViewMatrix(mat,proj,x,y,z,yaw,pitch)
+    
+    D.useProgram(convertToGrid_pro)
+
+    gl.enable(gl.BLEND)
+    
+    gl.bindBuffer(gl.ARRAY_BUFFER,particleVertBuffer)
+    gl.vertexAttribPointer(0,2,gl.FLOAT,gl.FALSE,8,0)
+    
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(particlePosition_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(particleVelocity_tex)
+    
+    D.bindFramebuffer(weight_fb)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.viewport(0,0,velocitiesWidth,velocitiesHeight)
+    
+    D.setUniform('accumulate',[0])
+    
+    let SPLAT_DEPTH=5;
+    for(let z=-(SPLAT_DEPTH-1)/2;z<=(SPLAT_DEPTH-1)/2;++z){
+        
+        D.setUniform('zOffset',[z])
+        gl.drawArrays(gl.POINTS,0,particlesCount)
+    }
+    
+    D.bindFramebuffer(_velocity_fb)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    
+    D.setUniform('accumulate',[1])
+
+    for(let z=-(SPLAT_DEPTH-1)/2;z<=(SPLAT_DEPTH-1)/2;++z){
+        
+        D.setUniform('zOffset',[z])
+        gl.drawArrays(gl.POINTS,0,particlesCount)
+    }
+    
+    //normalization step
+    
+    gl.disable(gl.BLEND)
+    
+    D.useProgram(normalizeGrid_pro)
+    D.bindFramebuffer(velocity_fb)
+    
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(_velocity_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(weight_tex)
+
+    D.renderMesh(screenMesh)
+    
+    
+    //mark step
+    
+    D.useProgram(marker_pro)
+    D.bindFramebuffer(marker_fb)
+    gl.viewport(0,0,scalarWidth,scalarHeight)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    D.bindTexture(particlePosition_tex)
+    gl.bindBuffer(gl.ARRAY_BUFFER,particleVertBuffer)
+    gl.vertexAttribPointer(0,2,gl.FLOAT,gl.FALSE,8,0)
+    gl.drawArrays(gl.POINTS,0,particlesCount)
+    
+    
+    //copy original velocity
+    
+    D.useProgram(copy_pro)
+    D.bindFramebuffer(originalVelocity_fb)
+    gl.viewport(0,0,velocitiesWidth,velocitiesHeight)
+    D.bindTexture(velocity_tex)
+    D.renderMesh(screenMesh)
+    
+    
+    //add forces
+    
+    D.useProgram(addForce_pro)
+    D.bindFramebuffer(_velocity_fb)
+    D.bindTexture(velocity_tex)
+    
+    D.setUniform('dt',[timeStep])
+    D.setUniform('mouseVelocity',mouseVelocity)
+    D.setUniform('mouseRayOrigin',[x,y,z])
+    D.setUniform('mouseRayDirection',mouseRayDirection)
+    
+    D.renderMesh(screenMesh)
+    
+    let t=velocity_fb
+    velocity_fb=_velocity_fb
+    _velocity_fb=t
+    
+    t=velocity_tex
+    velocity_tex=_velocity_tex
+    _velocity_tex=t
+    
+    
+    //compute divergence
+    
+    D.useProgram(divergence_pro)
+    D.bindFramebuffer(divergence_fb)
+    gl.viewport(0,0,scalarWidth,scalarHeight)
+    
+    gl.activeTexture(gl.TEXTURE2)
+    D.bindTexture(velocity_tex)
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(marker_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(weight_tex)
+    
+    D.renderMesh(screenMesh)
+    
+    
+    //compute pressure with jacobi iteration
+    
+    D.useProgram(jacobi_pro)
+    
+    D.bindFramebuffer(pressure_fb)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    
+    gl.activeTexture(gl.TEXTURE2)
+    D.bindTexture(divergence_tex)
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(marker_tex)
+    
+    gl.activeTexture(gl.TEXTURE0)
+    
+    for(let i=0;i<PRESSURE_JACOBI_ITERATIONS;++i){
+        
+        D.bindFramebuffer(_pressure_fb)
+        D.bindTexture(pressure_tex)
+        D.renderMesh(screenMesh)
+        
+        t=pressure_fb
+        pressure_fb=_pressure_fb
+        _pressure_fb=t
+        
+        t=pressure_tex
+        pressure_tex=_pressure_tex
+        _pressure_tex=t
+    }
+    
+    
+    //subtract pressure gradient from velocity
+    
+    D.useProgram(subtract_pro)
+    D.bindFramebuffer(_velocity_fb)
+    gl.viewport(0,0,velocitiesWidth,velocitiesHeight)
+    
+    
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(pressure_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(velocity_tex)
+    
+    D.renderMesh(screenMesh)
+    
+    t=velocity_fb
+    velocity_fb=_velocity_fb
+    _velocity_fb=t
+    
+    t=velocity_tex
+    velocity_tex=_velocity_tex
+    _velocity_tex=t
+    
+    
+    //transfer velocity back to particles
+    
+    D.useProgram(transferToParticles_pro)
+    D.bindFramebuffer(_particleVelocity_fb)
+    gl.viewport(0,0,particlesWidth,particlesHeight)
+    
+    gl.activeTexture(gl.TEXTURE3)
+    D.bindTexture(particlePosition_tex)
+    gl.activeTexture(gl.TEXTURE2)
+    D.bindTexture(particleVelocity_tex)
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(velocity_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(originalVelocity_tex)
+    
+    D.renderMesh(screenMesh)
+    
+    t=particleVelocity_fb
+    particleVelocity_fb=_particleVelocity_fb
+    _particleVelocity_fb=t
+    
+    t=particleVelocity_tex
+    particleVelocity_tex=_particleVelocity_tex
+    _particleVelocity_tex=t
+    
+    
+    //advect particle positions
+    
+    D.useProgram(advect_pro)
+    D.bindFramebuffer(_particlePosition_fb)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    
+    gl.activeTexture(gl.TEXTURE2)
+    D.bindTexture(particlePosition_tex)
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(particleRandom_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(velocity_tex)
+    
+    D.setUniform('dt',[timeStep])
+    D.setUniform('frameNumber',[frameCount])
+    
+    D.renderMesh(screenMesh)
+    
+    t=particlePosition_fb
+    particlePosition_fb=_particlePosition_fb
+    _particlePosition_fb=t
+    
+    t=particlePosition_tex
+    particlePosition_tex=_particlePosition_tex
+    _particlePosition_tex=t
+    
+    
+    //now render particles in 3d cool
+    
+    D.useProgram(surfaceRenderer_pro)
+    D.bindFramebuffer(normals_fb)
+    gl.viewport(0,0,width,height)
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT)
+    D.bindTexture(particlePosition_tex)
+    D.setUniform('viewMatrix',mat)
+    D.setUniform('cameraMatrixTranspose',mat4.transpose(viewInfo.modelMatrix,viewInfo.modelMatrix))
+    gl.bindBuffer(gl.ARRAY_BUFFER,particleVertBuffer)
+    gl.vertexAttribPointer(0,2,gl.FLOAT,gl.FALSE,8,0)
+    gl.drawArrays(gl.POINTS,0,particlesCount)
+    
+    if(!renderRaw){
+    
+    gl.enable(gl.BLEND)
+    D.useProgram(thicknessRenderer_pro)
+    D.bindFramebuffer(thickness_fb)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.viewport(0,0,halfWidth,halfHeight)
+    D.setUniform('viewMatrix',mat)
+    gl.drawArrays(gl.POINTS,0,particlesCount)
+    gl.disable(gl.BLEND)
+    
+    D.useProgram(lightHorBlur_pro)
+    D.bindFramebuffer(thicknessHorBlur_fb)
+    D.bindTexture(thickness_tex)
+    D.renderMesh(screenMesh)
+    
+    D.useProgram(lightVerBlur_pro)
+    D.bindFramebuffer(thicknessVerBlur_fb)
+    D.bindTexture(thicknessHorBlur_tex)
+    D.renderMesh(screenMesh)
+    
+    
+    gl.viewport(0,0,width,height)
+    D.useProgram(horBlur_pro)
+    D.bindFramebuffer(horBlur_fb)
+    D.bindTexture(normals_tex)
+    D.renderMesh(screenMesh)
+    
+    D.useProgram(verBlur_pro)
+    D.bindFramebuffer(verBlur_fb)
+    D.bindTexture(horBlur_tex)
+    D.renderMesh(screenMesh)
+    
+    D.useProgram(final_pro)
+    D.bindFramebuffer(finalRender_fb)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.viewport(0,0,width,height)
+    gl.activeTexture(gl.TEXTURE2)
+    D.bindTexture(normals_tex)
+    gl.activeTexture(gl.TEXTURE1)
+    D.bindTexture(verBlur_tex)
+    gl.activeTexture(gl.TEXTURE0)
+    D.bindTexture(thicknessVerBlur_tex)
+    D.setUniform('camDir',viewInfo.camDir)
+    D.renderMesh(screenMesh)
+    
+    D.useProgram(DBAA_pro)
+    D.bindFramebuffer(null)
+    D.bindTexture(finalRender_tex)
+    D.renderMesh(screenMesh)
+    
+    }else{
+    
+    D.useProgram(view_pro)
+    D.bindFramebuffer(null)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.viewport(0,0,width,height)
+    D.bindTexture(normals_tex)
+    D.renderMesh(screenMesh)
+    
+    }
+    
+    ctx.drawImage(glCanvas,0,0)
+    then=now
+    window.parent.raf=window.requestAnimationFrame(loop)
+    
+}
+
+if(window.parent.raf){
+    
+    window.cancelAnimationFrame(window.parent.raf)
+}
+
+loop(performance.now())
+
+
+
+}
+
+inter=window.setInterval(function(){if(window.innerWidth){main(0);window.clearInterval(inter)}});
+
+</script>
+
+<!--For restart button-->
+<script></script>
+
+</html>
